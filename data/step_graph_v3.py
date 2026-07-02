@@ -1,4 +1,3 @@
-
 """
 data/step_graph_v3.py
 STEP -> heterogeneous (face + edge) B-rep graph -> PyG Data.   [HGCAN_V3]
@@ -65,9 +64,19 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-from occwl.compound import Compound
-from occwl.graph import face_adjacency
-from occwl.edge_data_extractor import EdgeDataExtractor, EdgeConvexity
+try:
+    from occwl.compound import Compound
+    from occwl.graph import face_adjacency
+    from occwl.edge_data_extractor import EdgeDataExtractor, EdgeConvexity
+    _HAS_OCCWL = True
+except ImportError:
+    # occwl/pythonocc is only needed for PREPROCESSING (building the cache).
+    # Training/inference load a prebuilt cache and never touch CAD, so on
+    # environments without the CAD stack (e.g. Kaggle) we still want this module
+    # to import for its constants (NODE_FEAT_DIM, NUM_RELATIONS_V3). The CAD
+    # functions below will raise clearly only if actually called.
+    _HAS_OCCWL = False
+    Compound = face_adjacency = EdgeDataExtractor = EdgeConvexity = None
 
 # ---------------------------------------------------------------------------
 # Self-contained face vocabulary + feature extractor (no V2 dependency).
@@ -265,44 +274,73 @@ def _ugrid_edge(edge):
     return np.transpose(grid, (1, 0))                      # (6,10)
 
 
+# ============================================================ surface samples
+SAMPLE_FACE_N = 3       # 3x3 interior UV grid -> 9 points per face
+SAMPLE_EDGE_N = 5       # 5 points along each edge
+
+
+def _face_samples(face):
+    """(<=9, 3) surface points in body-local mm, from interior UV grid."""
+    try:
+        b = face.uv_bounds()
+        (umin, vmin), (umax, vmax) = b.min_point(), b.max_point()
+        pts = []
+        for u in np.linspace(umin, umax, SAMPLE_FACE_N + 2)[1:-1]:
+            for v in np.linspace(vmin, vmax, SAMPLE_FACE_N + 2)[1:-1]:
+                try:
+                    pts.append(np.asarray(face.point((float(u), float(v))), np.float32))
+                except Exception:
+                    pass
+        return np.stack(pts) if pts else np.zeros((0, 3), np.float32)
+    except Exception:
+        return np.zeros((0, 3), np.float32)
+
+
+def _edge_samples(edge):
+    """(<=5, 3) points along the curve in body-local mm (BRepAdaptor_Curve)."""
+    try:
+        from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
+        ad = BRepAdaptor_Curve(edge.topods_shape())
+        t0, t1 = ad.FirstParameter(), ad.LastParameter()
+        pts = []
+        for s in np.linspace(t0, t1, SAMPLE_EDGE_N):
+            p = ad.Value(float(s))
+            pts.append(np.array([p.X(), p.Y(), p.Z()], np.float32))
+        return np.stack(pts) if pts else np.zeros((0, 3), np.float32)
+    except Exception:
+        return np.zeros((0, 3), np.float32)
+
+
 # ============================================================ edge<->face ancestry
 def _edge_face_map(shape, faces):
     """For each TopoDS edge, the indices (into `faces`) of the faces it bounds.
-    Explorer-based (no IndexedDataMap API) -> stable across pythonocc builds.
-    Includes boundary edges of open shells (the hole-rim circles that matter).
+    LINEAR (O(E+F)): walk each face's edges once and accumulate parents in a
+    shape-keyed dict. Replaces the O(E*F) nested-IsSame scan, which grinds for
+    minutes on high-edge-count parts (e.g. breadboards with hundreds of holes).
+    Includes boundary edges of open shells (hole-rim circles that matter).
     """
     from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCC.Core.TopAbs import TopAbs_EDGE
     from OCC.Core.TopoDS import topods
     from occwl.edge import Edge
 
-    face_tds = [f.topods_shape() for f in faces]
-    shp = shape.topods_shape()
+    # TopoDS_Shape is hashable in pythonocc (by TShape+location); use it as key.
+    edge_rep = {}      # key -> representative TopoDS_Edge (first seen)
+    edge_faces = {}    # key -> set of face indices
+    for k, f in enumerate(faces):
+        fexp = TopExp_Explorer(f.topods_shape(), TopAbs_EDGE)
+        while fexp.More():
+            e = topods.Edge(fexp.Current())
+            key = e.__hash__()                 # cheap, version-stable shape hash
+            if key not in edge_rep:
+                edge_rep[key] = e
+                edge_faces[key] = set()
+            edge_faces[key].add(k)
+            fexp.Next()
 
-    # collect unique edges (dedupe by IsSame), and remember a representative
-    edges_tds = []
-    exp = TopExp_Explorer(shp, TopAbs_EDGE)
-    while exp.More():
-        e = topods.Edge(exp.Current())
-        if not any(e.IsSame(prev) for prev in edges_tds):
-            edges_tds.append(e)
-        exp.Next()
-
-    # for each edge, find which faces contain a same edge
     out = {}
-    for ei, e in enumerate(edges_tds):
-        fidx = []
-        for k, ftds in enumerate(face_tds):
-            fexp = TopExp_Explorer(ftds, TopAbs_EDGE)
-            found = False
-            while fexp.More():
-                if e.IsSame(fexp.Current()):
-                    found = True
-                    break
-                fexp.Next()
-            if found:
-                fidx.append(k)
-        out[ei] = (Edge(e), fidx)
+    for ei, (key, e) in enumerate(edge_rep.items()):
+        out[ei] = (Edge(e), sorted(edge_faces[key]))
     return out
 
 
@@ -327,6 +365,7 @@ def solid_to_graph_v3(shape, use_uvgrid=False) -> Data:
     node_type = np.zeros(F, np.int64)
     axis = np.zeros((F, 6), np.float32)
     axis_ok = np.zeros(F, bool)
+    face_samp_pts, face_samp_eid = [], []
     for k, f in enumerate(faces):
         feats[k, 0] = 1.0                                  # is_face
         feats[k, 2:2 + FACE_BLOCK] = _face_features(f, total_area)
@@ -334,6 +373,9 @@ def solid_to_graph_v3(shape, use_uvgrid=False) -> Data:
         axis_ok[k] = ok
         if ok:
             axis[k, :3], axis[k, 3:] = loc, d
+        sp = _face_samples(f)
+        if sp.shape[0]:
+            face_samp_pts.append(sp); face_samp_eid.append(np.full(sp.shape[0], k, np.int64))
 
     face_uv = [_uvgrid_face(f) for f in faces] if use_uvgrid else None
 
@@ -367,6 +409,7 @@ def solid_to_graph_v3(shape, use_uvgrid=False) -> Data:
     edge_feats = np.zeros((E, NODE_FEAT_DIM), np.float32)
     edge_axis = np.zeros((E, 6), np.float32)
     edge_axis_ok = np.zeros(E, bool)
+    edge_samp_pts, edge_samp_eid = [], []
     for k, e in enumerate(edge_objs):
         edge_feats[k, 1] = 1.0                             # is_edge
         edge_feats[k, 2 + FACE_BLOCK:] = _edge_features(e, total_len)
@@ -374,6 +417,9 @@ def solid_to_graph_v3(shape, use_uvgrid=False) -> Data:
         edge_axis_ok[k] = ok
         if ok:
             edge_axis[k, :3], edge_axis[k, 3:] = loc, d
+        sp = _edge_samples(e)
+        if sp.shape[0]:
+            edge_samp_pts.append(sp); edge_samp_eid.append(np.full(sp.shape[0], F + k, np.int64))
 
     edge_uv = [_ugrid_edge(e) for e in edge_objs] if use_uvgrid else None
 
@@ -408,25 +454,81 @@ def solid_to_graph_v3(shape, use_uvgrid=False) -> Data:
     data.node_type = torch.from_numpy(nt)
     data.entity_axis = torch.from_numpy(ent_axis)
     data.entity_axis_valid = torch.from_numpy(ent_ok)
-    data.num_faces = F
-    data.num_edges_geo = E
+    data.n_faces = F
+    data.n_edges = E
+    # per-entity surface sample points (body-local mm) + their entity id (0..F+E-1)
+    all_sp = face_samp_pts + edge_samp_pts
+    all_eid = face_samp_eid + edge_samp_eid
+    if all_sp:
+        data.entity_samples = torch.from_numpy(np.concatenate(all_sp, 0))
+        data.entity_sample_eid = torch.from_numpy(np.concatenate(all_eid, 0))
+    else:
+        data.entity_samples = torch.zeros((0, 3), dtype=torch.float32)
+        data.entity_sample_eid = torch.zeros((0,), dtype=torch.long)
     if use_uvgrid:
         data.face_uvgrid = torch.from_numpy(np.stack(face_uv)) if F else torch.zeros((0, 7, UV_NUM, UV_NUM))
         data.edge_ugrid = torch.from_numpy(np.stack(edge_uv)) if E else torch.zeros((0, 6, UV_NUM))
     return data
 
 
+def _merge_graphs(graphs):
+    """Concatenate per-solid graphs into ONE disconnected (islands) graph,
+    matching V2's full-solid policy. Re-indexes edges, samples, node counts.
+    Faces stay ahead of edges WITHIN each solid; offsets accumulate across."""
+    if len(graphs) == 1:
+        return graphs[0]
+    xs, nts, axes, oks = [], [], [], []
+    e_src, e_dst, e_rel = [], [], []
+    sp_pts, sp_eid = [], []
+    n_off = 0                                   # running node offset
+    F_tot = E_tot = 0
+    for g in graphs:
+        n = g.x.size(0)
+        xs.append(g.x); nts.append(g.node_type)
+        axes.append(g.entity_axis); oks.append(g.entity_axis_valid)
+        ei = g.edge_index + n_off
+        e_src += ei[0].tolist(); e_dst += ei[1].tolist()
+        e_rel += g.edge_type.tolist()
+        if g.entity_samples.shape[0]:
+            sp_pts.append(g.entity_samples)
+            sp_eid.append(g.entity_sample_eid + n_off)
+        n_off += n
+        F_tot += int(g.n_faces); E_tot += int(g.n_edges)
+    data = Data(
+        x=torch.cat(xs, 0),
+        edge_index=(torch.tensor([e_src, e_dst], dtype=torch.long)
+                    if e_src else torch.zeros((2, 0), dtype=torch.long)),
+        edge_type=(torch.tensor(e_rel, dtype=torch.long)
+                   if e_rel else torch.zeros((0,), dtype=torch.long)),
+    )
+    data.node_type = torch.cat(nts, 0)
+    data.entity_axis = torch.cat(axes, 0)
+    data.entity_axis_valid = torch.cat(oks, 0)
+    data.n_faces = F_tot
+    data.n_edges = E_tot
+    data.entity_samples = torch.cat(sp_pts, 0) if sp_pts else torch.zeros((0, 3))
+    data.entity_sample_eid = (torch.cat(sp_eid, 0) if sp_eid
+                              else torch.zeros((0,), dtype=torch.long))
+    return data
+
+
 def step_to_graph_v3(step_path: str, use_uvgrid=False) -> Data:
-    """One a1.0.0 <guid>.step (single body) -> heterogeneous PyG Data."""
+    """One a1.0.0 <guid>.step -> heterogeneous PyG Data. ALL solids are kept as
+    disconnected islands (V2 full-solid policy), not just the largest."""
     comp = Compound.load_from_step(str(step_path))
     if comp is None:
         raise StepGraphError("STEP read failed")
     solids = list(comp.solids())
     if len(solids) >= 1:
-        if len(solids) > 1:
-            solids.sort(key=lambda s: s.volume(), reverse=True)
-            print(f"  warn: {len(solids)} solids in {step_path}, keeping largest")
-        return solid_to_graph_v3(solids[0], use_uvgrid=use_uvgrid)
+        graphs = []
+        for s in solids:
+            try:
+                graphs.append(solid_to_graph_v3(s, use_uvgrid=use_uvgrid))
+            except StepGraphError:
+                continue                        # skip a bad island, keep the rest
+        if not graphs:
+            raise StepGraphError("no usable solids")
+        return _merge_graphs(graphs)
     if sum(1 for _ in comp.faces()) == 0:
         raise StepGraphError("no faces in STEP file (empty transfer)")
     return solid_to_graph_v3(comp, use_uvgrid=use_uvgrid)
