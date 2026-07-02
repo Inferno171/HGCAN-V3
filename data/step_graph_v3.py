@@ -89,11 +89,17 @@ SURF_TYPES = [
 SURF_TO_IDX = {s: i for i, s in enumerate(SURF_TYPES)}
 
 EDGE_CONVEX, EDGE_CONCAVE, EDGE_SMOOTH = 0, 1, 2
-CONVEXITY_TO_REL = {
-    EdgeConvexity.CONVEX: EDGE_CONVEX,
-    EdgeConvexity.CONCAVE: EDGE_CONCAVE,
-    EdgeConvexity.SMOOTH: EDGE_SMOOTH,
-}
+# This mapping dereferences occwl's EdgeConvexity enum, so only build it when
+# the CAD stack is present. On cache-only environments (Kaggle) it stays empty;
+# it is used exclusively inside preprocessing functions, never during training.
+if _HAS_OCCWL:
+    CONVEXITY_TO_REL = {
+        EdgeConvexity.CONVEX: EDGE_CONVEX,
+        EdgeConvexity.CONCAVE: EDGE_CONCAVE,
+        EdgeConvexity.SMOOTH: EDGE_SMOOTH,
+    }
+else:
+    CONVEXITY_TO_REL = {}
 
 SMOOTH_TOL_RADS = 0.0872   # ~5 deg: dihedral below this counts as smooth/tangent
 CURV_SAMPLES = 5           # 5x5 interior UV grid for curvature statistics
